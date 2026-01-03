@@ -2,6 +2,10 @@
 """
 Sales Summary GUI - Python/Tkinter Version
 Analyzes Project Gorgon Player Shop Log files
+
+Uses "Authority File" algorithm to prevent duplicate counting:
+- For each unique line date, only process lines from the file that has
+  the most entries for that date (the authority file).
 """
 
 import tkinter as tk
@@ -226,113 +230,210 @@ class SalesViewerGUI:
         
         # Update total earned label
         self.lbl_total.config(text=f"Total Earned: {total_earned_sum:,}")
-            
-    def parse_file_date(self, filename):
+    
+    # =========================================================================
+    # NEW: Authority File Algorithm for Deduplication
+    # =========================================================================
+    
+    # Month abbreviation to number mapping
+    MONTH_MAP = {
+        'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+        'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+    }
+    
+    def parse_filename_info(self, filename):
         """
-        Extract date from filename in format PlayerShopLog_YYMMDD_HHMMSS.txt
-        Returns tuple: (date_string, timestamp_string, datetime_obj)
+        Extract date info from filename: PlayerShopLog_YYMMDD_HHMMSS.txt
+        Returns: (year, month) tuple or None if invalid
         """
-        match = re.match(r'^PlayerShopLog_(\d{6})_(\d+)$', filename)
+        match = re.match(r'^PlayerShopLog_(\d{6})_(\d+)\.txt$', filename)
         if not match:
             return None
-            
-        date_str = match.group(1)
-        time_str = match.group(2)
         
+        date_str = match.group(1)
         yy = int(date_str[0:2])
         mm = int(date_str[2:4])
-        dd = int(date_str[4:6])
+        
+        return (2000 + yy, mm)
+    
+    def parse_line_date_string(self, line):
+        """
+        Extract the date string from a log line.
+        Example: "Mon Jun 2 23:46 - ..." -> "Mon Jun 2"
+        Returns the date string or None if not found.
+        """
+        # Match pattern: DayOfWeek Month DayNum Time
+        match = re.match(r'^(\w{3}\s+\w{3}\s+\d+)', line)
+        if match:
+            return match.group(1)
+        return None
+    
+    def calculate_full_date(self, line_date_str, file_year, file_month):
+        """
+        Calculate the full datetime from a line date string and filename info.
+        
+        Args:
+            line_date_str: e.g., "Sat May 31"
+            file_year: Year from filename (e.g., 2025)
+            file_month: Month from filename (e.g., 6 for June)
+        
+        Returns:
+            datetime object or None if parsing fails
+        """
+        # Parse the line date string
+        # Format: "DayOfWeek Month Day" e.g., "Sat May 31"
+        parts = line_date_str.split()
+        if len(parts) < 3:
+            return None
+        
+        month_abbr = parts[1]
+        day_num = int(parts[2])
+        
+        line_month = self.MONTH_MAP.get(month_abbr)
+        if line_month is None:
+            return None
+        
+        # Determine the year with rollover check
+        # If filename is January but line is December, line is from previous year
+        year = file_year
+        if file_month == 1 and line_month == 12:
+            year = file_year - 1
         
         try:
-            date_obj = datetime(2000 + yy, mm, dd)
-            return (date_str, time_str, date_obj)
+            return datetime(year, line_month, day_num)
         except ValueError:
             return None
-            
-    def get_latest_files_by_date(self, folder, start_date, end_date):
+    
+    def scan_files_for_authority(self, folder):
         """
-        Get the latest file for each date within the date range.
+        SCAN PHASE: Read all log files and count lines per date per file.
         
-        This is the complex logic from the PowerShell script:
-        1. Find all files matching PlayerShopLog_*.txt
-        2. Filter by date range
-        3. Group by date (YYMMDD part)
-        4. For each date, select the file with the highest timestamp
-        
-        Returns: dict mapping date_obj to file_path
+        Returns:
+            counts: dict[line_date_str][filepath] = line_count
+            file_info: dict[filepath] = (file_year, file_month)
         """
-        files_by_date = defaultdict(list)
+        counts = defaultdict(lambda: defaultdict(int))
+        file_info = {}
         
-        # Find all matching files
         pattern = re.compile(r'^PlayerShopLog_(\d{6})_(\d+)\.txt$')
         
-        try:
-            for filename in os.listdir(folder):
-                match = pattern.match(filename)
-                if not match:
-                    continue
-                    
-                basename = filename[:-4]  # Remove .txt extension
-                parsed = self.parse_file_date(basename)
-                
-                if parsed is None:
-                    continue
-                    
-                date_str, time_str, date_obj = parsed
-                
-                # Filter by date range
-                if date_obj < start_date or date_obj > end_date:
-                    continue
-                    
-                # Group by date
-                file_path = os.path.join(folder, filename)
-                files_by_date[date_obj].append((int(time_str), file_path))
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Error reading folder: {str(e)}")
-            return {}
+        for filename in os.listdir(folder):
+            if not pattern.match(filename):
+                continue
             
-        # For each date, select the file with the highest timestamp
-        latest_files = {}
-        for date_obj, file_list in files_by_date.items():
-            # Sort by timestamp (descending) and take the first (latest)
-            file_list.sort(reverse=True)
-            latest_files[date_obj] = file_list[0][1]  # Get the file path
+            parsed = self.parse_filename_info(filename)
+            if parsed is None:
+                continue
             
-        return latest_files
+            file_year, file_month = parsed
+            file_path = os.path.join(folder, filename)
+            file_info[file_path] = (file_year, file_month)
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line_date_str = self.parse_line_date_string(line)
+                        if line_date_str:
+                            counts[line_date_str][file_path] += 1
+            except Exception:
+                pass
         
-    def parse_sales_data(self, file_path, date_obj):
+        return counts, file_info
+    
+    def select_authority_files(self, counts):
         """
-        Parse sales data from a log file.
-        Returns list of sales dictionaries.
+        SELECTION PHASE: For each unique line date, find the file with the most lines.
+        
+        Args:
+            counts: dict[line_date_str][filepath] = line_count
+        
+        Returns:
+            best_files: dict[line_date_str] = winning_filepath
         """
-        sales = []
+        best_files = {}
+        
+        for line_date_str, file_counts in counts.items():
+            # Find the file with the highest count for this date
+            winning_file = max(file_counts.keys(), key=lambda fp: file_counts[fp])
+            best_files[line_date_str] = winning_file
+        
+        return best_files
+    
+    def extract_sales_with_authority(self, folder, best_files, file_info, start_date, end_date):
+        """
+        EXTRACTION PHASE: Parse sales only from authority files for each date.
+        
+        Args:
+            folder: Path to log folder
+            best_files: dict[line_date_str] = winning_filepath
+            file_info: dict[filepath] = (file_year, file_month)
+            start_date: Filter start date
+            end_date: Filter end date
+        
+        Returns:
+            List of sales dictionaries
+        """
+        all_sales = []
         
         # Regex pattern to match purchase lines
-        pattern = re.compile(
+        buy_pattern = re.compile(
             r"- (?P<buyer>\S+) bought\s+(?P<item>.+?)(?:\s*x(?P<qty>\d+))?\s+at a cost.*=\s*(?P<earned>\d+)$"
         )
         
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if 'bought' not in line:
-                        continue
-                        
-                    match = pattern.search(line)
-                    if match:
-                        sales.append({
-                            'Buyer': match.group('buyer'),
-                            'Item': match.group('item').strip(),
-                            'Quantity': int(match.group('qty')) if match.group('qty') else 1,
-                            'Earned': int(match.group('earned')),
-                            'SaleDate': date_obj
-                        })
-        except Exception as e:
-            # Skip files that can't be read
-            pass
+        # Get unique files that are authority for at least one date
+        authority_files = set(best_files.values())
+        
+        for file_path in authority_files:
+            if file_path not in file_info:
+                continue
             
-        return sales
+            file_year, file_month = file_info[file_path]
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        # Extract line date string
+                        line_date_str = self.parse_line_date_string(line)
+                        if not line_date_str:
+                            continue
+                        
+                        # Check if this file is the authority for this line's date
+                        if best_files.get(line_date_str) != file_path:
+                            continue
+                        
+                        # Calculate full date
+                        full_date = self.calculate_full_date(line_date_str, file_year, file_month)
+                        if full_date is None:
+                            continue
+                        
+                        # Filter by date range
+                        if full_date < start_date or full_date > end_date:
+                            continue
+                        
+                        # Check if this is a purchase line
+                        if 'bought' not in line:
+                            continue
+                        
+                        match = buy_pattern.search(line)
+                        if match:
+                            all_sales.append({
+                                'Buyer': match.group('buyer'),
+                                'Item': match.group('item').strip(),
+                                'Quantity': int(match.group('qty')) if match.group('qty') else 1,
+                                'Earned': int(match.group('earned')),
+                                'SaleDate': full_date
+                            })
+            except Exception:
+                pass
+        
+        # Sort by date
+        all_sales.sort(key=lambda x: x['SaleDate'])
+        
+        return all_sales
+    
+    # =========================================================================
+    # END: Authority File Algorithm
+    # =========================================================================
         
     def apply_filters(self, sales_data, buyer_filter, item_filter, item_exact):
         """Apply buyer and item filters to sales data"""
@@ -418,24 +519,34 @@ class SalesViewerGUI:
             except ValueError:
                 messagebox.showerror("Error", "Invalid date format. Use MM/DD/YYYY")
                 return
-                
-            # Get latest files by date
-            latest_files = self.get_latest_files_by_date(folder, start_date, end_date)
             
-            if not latest_files:
-                self.lbl_summary.config(text="No files found in the specified date range.")
+            # =====================================================
+            # NEW: Authority File Algorithm
+            # =====================================================
+            
+            # Phase 1: Scan all files and count lines per date per file
+            counts, file_info = self.scan_files_for_authority(folder)
+            
+            if not counts:
+                self.lbl_summary.config(text="No log files found in the folder.")
                 self.current_results = []
                 self.display_results([])
                 return
-                
-            # Parse sales data from all files
-            all_sales = []
-            for date_obj, file_path in latest_files.items():
-                sales = self.parse_sales_data(file_path, date_obj)
-                all_sales.extend(sales)
+            
+            # Phase 2: Select the authority file for each date
+            best_files = self.select_authority_files(counts)
+            
+            # Phase 3: Extract sales using authority files only
+            all_sales = self.extract_sales_with_authority(
+                folder, best_files, file_info, start_date, end_date
+            )
+            
+            # =====================================================
+            # END: Authority File Algorithm
+            # =====================================================
                 
             if not all_sales:
-                self.lbl_summary.config(text="No sales data found in the files.")
+                self.lbl_summary.config(text="No sales data found in the specified date range.")
                 self.current_results = []
                 self.display_results([])
                 return
